@@ -1,0 +1,10 @@
+Debug/
+Debug_FLASH/
+Binaries/
+*.elf
+*.bin
+*.map
+.settings/
+.project
+.classpath
+*.mex
