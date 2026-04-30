@@ -1,7 +1,7 @@
 #include "sdk_project_config.h"
 #include <stdint.h>
 #include <stdbool.h>
-
+//Commit 2
 /* Define Pins/Ports/Interrupt etc. */
 #define EVB
 
@@ -22,10 +22,15 @@
 	/*Reserved block for different board configurations if needed */
 #endif
 
-uint8_t blinkCount = 3;
+uint8_t blinkCount = 5;
+volatile bool flag_button_event = false;
+volatile bool flag_can_rx = false;
+
+flexcan_msgbuff_t recvBuff;
+
 
 #define MASTER
-/* #define SLAVE */
+/* #define SLAVE*/
 
 /* Define the RX and TX mailbox and message configuration for whether the node will be the master or slave board */
 #if defined(MASTER)
@@ -47,7 +52,7 @@ typedef enum
     LED1_CHANGE_REQUESTED = 0x01U
 } can_commands_list;
 
-uint8_t ledRequested = (uint8_t)LED0_CHANGE_REQUESTED;
+volatile uint8_t ledRequested = (uint8_t)LED0_CHANGE_REQUESTED;
 
 bool useEncryption = false;
 
@@ -60,6 +65,11 @@ void BoardInit(void);
 void GPIOInit(void);
 void FlexCANInit(void);
 
+void canRxCallback(uint8_t instance,
+                   flexcan_event_type_t eventType,
+                   uint32_t buffIdx,
+                   flexcan_state_t *state);
+
 /*
 	Functions Section
 */
@@ -69,65 +79,23 @@ void FlexCANInit(void);
  */
 void buttonISR(void)
 {
-    /* Check if one of the buttons was pressed */
     uint32_t buttonsPressed = PINS_DRV_GetPortIntFlag(BTN_PORT) &
-                                           ((1 << BTN1_PIN) | (1 << BTN2_PIN));
-    uint32_t buttons = PINS_DRV_ReadPins(BTN_GPIO);
-    bool sendFrame = false;
+                              ((1 << BTN1_PIN) | (1 << BTN2_PIN));
 
-    if(buttonsPressed != 0)
+    if (buttonsPressed != 0)
     {
-
-        /* Set FlexCAN TX value according to the button pressed */
-        switch (buttonsPressed)
+        if (buttonsPressed & (1 << BTN1_PIN))
         {
-            case (1 << BTN1_PIN):
-                if (buttons & ((1 << BTN2_PIN)))
-                {
-                    useEncryption = !useEncryption;
-                    PINS_DRV_TogglePins(GPIO_PORT, (1 << LED2));
-                }
-                else
-                {
-                    ledRequested = LED0_CHANGE_REQUESTED;
-                    sendFrame = true;
-                }
-                /* Clear interrupt flag */
-                PINS_DRV_ClearPinIntFlagCmd(BTN_PORT, BTN1_PIN);
-                break;
-            case (1 << BTN2_PIN):
-                ledRequested = LED1_CHANGE_REQUESTED;
-                sendFrame = true;
-                /* Clear interrupt flag */
-                PINS_DRV_ClearPinIntFlagCmd(BTN_PORT, BTN2_PIN);
-                break;
-            default:
-                PINS_DRV_ClearPortIntFlagCmd(BTN_PORT);
-                break;
+        	ledRequested = LED0_CHANGE_REQUESTED;
+            PINS_DRV_ClearPinIntFlagCmd(BTN_PORT, BTN1_PIN);
+        }
+        else if (buttonsPressed & (1 << BTN2_PIN))
+        {
+        	ledRequested = LED1_CHANGE_REQUESTED;
+            PINS_DRV_ClearPinIntFlagCmd(BTN_PORT, BTN2_PIN);
         }
 
-        if (useEncryption && sendFrame)
-        {
-            uint8_t plaintext[16] = {0,};
-            uint8_t ciphertext[16];
-            status_t stat;
-
-            plaintext[0] = ledRequested;
-
-            /* Encrypt data using AES-128 ECB and the first non-volatile user key */
-            stat = CSEC_DRV_EncryptECB(CSEC_KEY_1, plaintext, 16UL, ciphertext, 1UL);
-
-            if (stat == STATUS_SUCCESS)
-            {
-                /* Send the information via CAN */
-                SendCANData(TX_MAILBOX, TX_MSG_ID, ciphertext, 16UL);
-            }
-        }
-        else if (sendFrame)
-        {
-            /* Send the information via CAN */
-            SendCANData(TX_MAILBOX, TX_MSG_ID, &ledRequested, 1UL);
-        }
+        flag_button_event = true;
     }
 }
 
@@ -219,6 +187,18 @@ void FlexCANInit(void)
      *  - Bus clock as peripheral engine clock
      */
     FLEXCAN_DRV_Init(INST_FLEXCAN_CONFIG_1, &flexcanState0, &flexcanInitConfig0);
+    FLEXCAN_DRV_InstallEventCallback(INST_FLEXCAN_CONFIG_1, canRxCallback, NULL);
+}
+
+void canRxCallback(uint8_t instance,
+                   flexcan_event_type_t eventType,
+                   uint32_t buffIdx,
+                   flexcan_state_t *state)
+{
+    if ((eventType == FLEXCAN_EVENT_RX_COMPLETE) && (buffIdx == RX_MAILBOX))
+    {
+        flag_can_rx = true;
+    }
 }
 
 volatile int exit_code = 0;
@@ -231,7 +211,6 @@ int main(void)
     BoardInit();
     GPIOInit();
     FlexCANInit();
-    CSEC_DRV_Init(&csecState);
 
     /* Set information about the data to be received
      *  - 1 byte in length
@@ -252,58 +231,46 @@ int main(void)
     /* Configure RX message buffer with index RX_MSG_ID and RX_MAILBOX */
     FLEXCAN_DRV_ConfigRxMb(INST_FLEXCAN_CONFIG_1, RX_MAILBOX, &dataInfo, RX_MSG_ID);
 
+    FLEXCAN_DRV_Receive(INST_FLEXCAN_CONFIG_1, RX_MAILBOX, &recvBuff);
+
     while(1)
     {
-        /* Define receive buffer */
-        flexcan_msgbuff_t recvBuff;
+    	if (flag_button_event)
+    	{
+    	    flag_button_event = false;
+    	    uint8_t txData = ledRequested;
+    	    SendCANData(TX_MAILBOX, TX_MSG_ID, &txData, 1U);
+    	}
 
-        /* Start receiving data in RX_MAILBOX. */
-        FLEXCAN_DRV_Receive(INST_FLEXCAN_CONFIG_1, RX_MAILBOX, &recvBuff);
+    	if (flag_can_rx)
+    	{
+    	    flag_can_rx = false;
 
-        /* Wait until the previous FlexCAN receive is completed */
-        while(FLEXCAN_DRV_GetTransferStatus(INST_FLEXCAN_CONFIG_1, RX_MAILBOX) == STATUS_BUSY);
-        if (useEncryption)
-		{
-			/* Check the length of the received message */
-			if (recvBuff.dataLen == 16)
-			{
-				status_t stat;
+    	    // Process message
+    	    if ((recvBuff.data[0] == LED0_CHANGE_REQUESTED) &&
+    	        (recvBuff.msgId == RX_MSG_ID))
+    	    {
+    	        // trigger LED0 action (still blocking for now)
+            	for (int i = 0; i < blinkCount; i++){
+            		/* Toggle output value LED0 */
+            		PINS_DRV_TogglePins(GPIO_PORT, (1 << LED0));
+            		OSIF_TimeDelay(150); //Delay
+            	}
+    	    }
+    	    else if ((recvBuff.data[0] == LED1_CHANGE_REQUESTED) &&
+    	             (recvBuff.msgId == RX_MSG_ID))
+    	    {
+    	        // trigger LED1 action
+            	for (int i = 0; i < blinkCount; i++){
+                    /* Toggle output value LED1 */
+                    PINS_DRV_TogglePins(GPIO_PORT, (1 << LED1));
+                    OSIF_TimeDelay(150); //Delay
+            	}
+    	    }
 
-				/* Decrypt data using AES-128 ECB and the first non-volatile user key */
-				stat = CSEC_DRV_DecryptECB(CSEC_KEY_1, recvBuff.data, 16UL, recvBuff.data, 1UL);
-
-				if (stat != STATUS_SUCCESS)
-				{
-					continue;
-				}
-			}
-			else
-			{
-				continue;
-			}
-		}
-
-        /* Check the received message ID and payload */
-        if((recvBuff.data[0] == LED0_CHANGE_REQUESTED) &&
-                recvBuff.msgId == RX_MSG_ID)
-        {
-        	for (int i = 0; i < blinkCount; i++){
-        		/* Toggle output value LED0 */
-        		PINS_DRV_TogglePins(GPIO_PORT, (1 << LED0));
-        		OSIF_TimeDelay(150); //Delay
-        	}
-
-        }
-        else if((recvBuff.data[0] == LED1_CHANGE_REQUESTED) &&
-                recvBuff.msgId == RX_MSG_ID)
-        {
-        	for (int i = 0; i < blinkCount; i++){
-                /* Toggle output value LED1 */
-                PINS_DRV_TogglePins(GPIO_PORT, (1 << LED1));
-                OSIF_TimeDelay(150); //Delay
-        	}
-
-        }
+    	    // RE-ARM receive
+    	    FLEXCAN_DRV_Receive(INST_FLEXCAN_CONFIG_1, RX_MAILBOX, &recvBuff);
+    	}
     }
   for(;;) {
     if(exit_code != 0) {
